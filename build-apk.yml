@@ -1,0 +1,80 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+
+      - name: Prepare web files
+        run: |
+          mkdir -p www
+          ls -la
+          H=$(ls index*.html 2>/dev/null | head -n1); [ -z "$H" ] && H=$(ls *.html | head -n1)
+          [ -n "$H" ] || { echo "no html file in repo root"; exit 1; }
+          cp "$H" www/index.html
+          M=$(ls manifest*.json 2>/dev/null | head -n1); [ -n "$M" ] && cp "$M" www/manifest.json || true
+          S=$(ls sw*.js 2>/dev/null | head -n1);       [ -n "$S" ] && cp "$S" www/sw.js || true
+          for f in icon-192.png icon-512.png; do [ -f "$f" ] && cp "$f" www/ || echo "skip $f"; done
+
+      - name: Capacitor project
+        run: |
+          npm init -y
+          npm i --no-audit --no-fund @capacitor/core @capacitor/cli @capacitor/android @capacitor/local-notifications @capacitor/preferences
+          npx cap init "Dawah دعوة" com.dawa.platform --web-dir=www
+          npx cap add android
+          npx cap sync android
+
+      - name: Native adhan code (plugin, service, receivers)
+        run: |
+          PKG=com.dawa.platform
+          DIR=android/app/src/main/java/com/dawa/platform
+          mkdir -p $DIR
+          for f in MainActivity AdhanService AdhanReceiver AdhanScheduler BootReceiver DawaAdhanPlugin; do
+            [ -f "$f.java" ] || { echo "MISSING $f.java in repo root"; exit 1; }
+            sed -E "s/^package .*;/package $PKG;/; s/com\.dawa\.app/$PKG/g" "$f.java" > "$DIR/$f.java"
+          done
+          RAW=android/app/src/main/res/raw
+          mkdir -p $RAW
+          if [ -f adhan.mp3 ]; then cp adhan.mp3 $RAW/adhan.mp3
+          else curl -fsSL --retry 3 -o $RAW/adhan.mp3 https://cdn.aladhan.com/audio/adhans/a9.mp3 || { rm -f $RAW/adhan.mp3; echo "default adhan not downloaded"; }
+          fi
+          python3 - <<'PY'
+          import re
+          p="android/app/src/main/AndroidManifest.xml"
+          s=open(p,encoding="utf-8").read()
+          perms=["INTERNET","POST_NOTIFICATIONS","ACCESS_COARSE_LOCATION","ACCESS_FINE_LOCATION","SCHEDULE_EXACT_ALARM","USE_EXACT_ALARM","RECEIVE_BOOT_COMPLETED","WAKE_LOCK","VIBRATE","FOREGROUND_SERVICE","FOREGROUND_SERVICE_MEDIA_PLAYBACK","REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"]
+          add="".join('    <uses-permission android:name="android.permission.%s" />\n'%x for x in perms if "android.permission.%s\""%x not in s)
+          s=s.replace("<application",add+"    <application",1)
+          comp='''
+              <service android:name=".AdhanService" android:exported="false" android:foregroundServiceType="mediaPlayback" />
+              <receiver android:name=".AdhanReceiver" android:exported="false" />
+              <receiver android:name=".BootReceiver" android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      <action android:name="android.intent.action.TIME_SET" />
+                      <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                  </intent-filter>
+              </receiver>
+          '''
+          if "AdhanService" not in s: s=s.replace("</application>",comp+"</application>",1)
+          open(p,"w",encoding="utf-8").write(s)
+          PY
+          grep -c "AdhanService" android/app/src/main/AndroidManifest.xml
+          grep -c "ACCESS_FINE_LOCATION" android/app/src/main/AndroidManifest.xml
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dawah-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
